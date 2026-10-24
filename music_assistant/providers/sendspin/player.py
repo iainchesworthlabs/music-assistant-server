@@ -138,6 +138,7 @@ from .helpers import (
     pin_code_format,
     speaks_legacy_wire,
 )
+from .coded import client_support, fit_chunk_limit
 from .playback import SendspinPlaybackSession
 
 # Supported group commands for Sendspin players
@@ -2268,7 +2269,15 @@ class SendspinPlayer(SendspinBasePlayer):
         )
         if config_value == SENDSPIN_FORMAT_AUTOMATIC:
             # Automatic mode: follow the session sample rate, else let the client decide.
-            player_role.set_preferred_format(*self._session_format(player_role))
+            fmt, codec = self._session_format(player_role)
+            # a board that states a small max_chunk_bytes cannot take 25 ms PCM chunks
+            support = client_support(self.api)
+            fmt, codec = fit_chunk_limit(
+                player_role.get_supported_formats() or [],
+                (fmt, codec),
+                support.max_chunk_bytes if support else None,
+            )
+            player_role.set_preferred_format(fmt, codec)
             return
 
         parsed = option_value_to_format(config_value)

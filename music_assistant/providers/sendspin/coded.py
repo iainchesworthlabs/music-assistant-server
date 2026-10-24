@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from aiosendspin.models import AudioCodec
+from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
 from music_assistant_models.enums import ContentType
 
 from music_assistant.helpers.passthrough import (
@@ -43,6 +45,7 @@ from .ma_role import role as iclforge_role
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterable
 
+    from aiosendspin.models.player import SupportedAudioFormat
     from aiosendspin.server.client import SendspinClient
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -50,7 +53,11 @@ DATA_TYPE = "eac3"
 # the sink holds a coded start until its clock converged (about 2 s after activation)
 CODED_START_HOLD_S = 2.5
 STATE_TIMEOUT_S = 10.0
-STEREO_BIT_RATE = 192_000
+# a board that decodes 15-object material at 192 kb/s stereo at its limit (the C6) gets less to chew
+STEREO_BIT_RATE = 128_000
+# the push stream cuts PCM into 25 ms chunks; a board states the largest message it takes
+PCM_CHUNK_US = 25_000
+CHUNK_OVERHEAD_BYTES = 40
 # added to the largest required lead time of the coded members for the first burst's timestamp
 CODED_LEAD_MARGIN_US = 300_000
 # a board buffers bursts only up to its stated buffer_capacity, and drops what does not fit: the
@@ -62,6 +69,61 @@ _BURST_QUEUE_SIZE = 96
 
 # the one place the role is registered: importing this module is enough
 iclforge_role.register()
+
+
+def pcm_message_bytes(audio_format: SupportedAudioFormat) -> int:
+    """
+    Return the size of one PCM chunk message of the push stream for a format.
+
+    :param audio_format: The PCM format a client lists.
+    """
+    samples = audio_format.sample_rate * PCM_CHUNK_US // 1_000_000
+    return samples * audio_format.channels * (audio_format.bit_depth // 8) + CHUNK_OVERHEAD_BYTES
+
+
+def fit_chunk_limit(
+    formats: list[SupportedAudioFormat],
+    preferred: tuple[SendspinAudioFormat | None, AudioCodec | None],
+    max_chunk_bytes: int | None,
+) -> tuple[SendspinAudioFormat | None, AudioCodec | None]:
+    """
+    Return the format to prefer so that no chunk message is larger than the client takes.
+
+    A board that states ``max_chunk_bytes`` below the size of a PCM chunk (the C6 states 4096,
+    a 48 kHz 16-bit stereo chunk is 4,829 bytes) closes the connection at stream start. Opus, and
+    failing that FLAC, chunks are smaller, so the first of those the client lists is preferred,
+    at the sample rate in use. Anything else (a limit that is not stated, a format that already
+    fits, a client without a compressed codec) leaves the choice as it was.
+
+    :param formats: The formats the client lists, in its own priority order.
+    :param preferred: The (format, codec) MA would otherwise prefer, (None, None) for the client's top.
+    :param max_chunk_bytes: The largest message the client states it takes.
+    """
+    if not max_chunk_bytes or not formats:
+        return preferred
+    fmt, codec = preferred
+    if fmt is None or codec is None:
+        top = formats[0]
+        codec, rate = top.codec, top.sample_rate
+        size = pcm_message_bytes(top)
+    else:
+        rate = fmt.sample_rate
+        size = fmt.sample_rate * PCM_CHUNK_US // 1_000_000 * fmt.channels * (fmt.bit_depth // 8)
+        size += CHUNK_OVERHEAD_BYTES
+    if codec != AudioCodec.PCM or size <= max_chunk_bytes:
+        return preferred
+    for wanted in (AudioCodec.OPUS, AudioCodec.FLAC):
+        options = [f for f in formats if f.codec == wanted]
+        options.sort(key=lambda f: (f.sample_rate != rate, f.channels != 2))
+        if options:
+            best = options[0]
+            return (
+                SendspinAudioFormat(
+                    sample_rate=best.sample_rate, bit_depth=best.bit_depth, channels=best.channels
+                ),
+                wanted,
+            )
+    return preferred
 
 
 def coded_start_lead_us(
@@ -170,8 +232,10 @@ class CodedTap:
         sample_rate: int,
         lanes: list[_Lane],
         pcm_clients: list[SendspinClient],
+        stereo_bit_rate: int = STEREO_BIT_RATE,
     ) -> None:
         """Initialize the tap, use :func:`build_coded_tap` instead."""
+        self._stereo_bit_rate = stereo_bit_rate
         self._logger = logger
         self._path = path
         self._seek = seek_position
@@ -360,7 +424,7 @@ class CodedTap:
         builder = eac3.Eac3BurstBuilder()
         stereo = lane.variant == CodedVariant.STEREO
         stream = get_eac3_demux_stream(
-            self._path, self._seek, stereo_bit_rate=STEREO_BIT_RATE if stereo else None
+            self._path, self._seek, stereo_bit_rate=self._stereo_bit_rate if stereo else None
         )
         try:
             async for unit in iter_eac3_access_units(_chunks_of(stream)):

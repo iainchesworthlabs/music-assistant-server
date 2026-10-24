@@ -11,6 +11,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from aiosendspin.models import AudioCodec
+from aiosendspin.models.player import SupportedAudioFormat
+from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
 from aiosendspin.server.connection import SendspinConnection
 from aiosendspin.server.roles.negotiation import negotiate_roles
 from music_assistant_models.enums import ContentType, MediaType, StreamType
@@ -27,6 +30,8 @@ from music_assistant.providers.sendspin.coded import (
     build_coded_tap,
     coded_start_lead_us,
     first_play_start_us,
+    fit_chunk_limit,
+    pcm_message_bytes,
 )
 from music_assistant.providers.sendspin.ma_role import eac3
 from music_assistant.providers.sendspin.ma_role import role as iclforge_role
@@ -255,3 +260,42 @@ async def test_sending_stays_inside_the_buffer_the_board_states(
     tap._clock_anchor = (2_000_000, tap._clock_anchor[1])  # type: ignore[index]
     tap._send_due(lane)
     assert role.sent == 90
+
+
+def _formats() -> list[Any]:
+
+    return [
+        SupportedAudioFormat(codec=AudioCodec.PCM, channels=2, sample_rate=48000, bit_depth=16),
+        SupportedAudioFormat(codec=AudioCodec.PCM, channels=2, sample_rate=48000, bit_depth=24),
+        SupportedAudioFormat(codec=AudioCodec.OPUS, channels=2, sample_rate=48000, bit_depth=16),
+    ]
+
+
+def test_pcm_chunk_that_does_not_fit_the_board_gives_opus() -> None:
+    """A board stating max_chunk_bytes 4096 cannot take 4,829-byte PCM chunks: Opus instead."""
+    formats = _formats()
+    assert pcm_message_bytes(formats[0]) == 4840  # 25 ms 48 kHz 16-bit stereo + overhead
+    fmt, codec = fit_chunk_limit(formats, (None, None), 4096)
+    assert codec == AudioCodec.OPUS
+    assert fmt is not None
+    assert (fmt.sample_rate, fmt.channels) == (48000, 2)
+
+
+def test_chunk_limit_leaves_the_choice_alone_when_it_fits_or_is_not_stated() -> None:
+    """No limit, a roomy limit, or an explicit non-PCM choice is not touched."""
+    formats = _formats()
+    assert fit_chunk_limit(formats, (None, None), None) == (None, None)
+    assert fit_chunk_limit(formats, (None, None), 25_600) == (None, None)
+    opus = (SendspinAudioFormat(sample_rate=48000, bit_depth=16, channels=2), AudioCodec.OPUS)
+    assert fit_chunk_limit(formats, opus, 4096) == opus
+
+
+def test_chunk_limit_falls_back_to_flac_then_to_the_original() -> None:
+    """Without Opus the first FLAC format is used; without either nothing changes."""
+    pcm = _formats()[:2]
+    flac = [
+        *pcm,
+        SupportedAudioFormat(codec=AudioCodec.FLAC, channels=2, sample_rate=48000, bit_depth=16),
+    ]
+    assert fit_chunk_limit(flac, (None, None), 4096)[1] == AudioCodec.FLAC
+    assert fit_chunk_limit(pcm, (None, None), 4096) == (None, None)
