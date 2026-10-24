@@ -1,0 +1,2 @@
+Verbatim copy of tools/sendspin/ma_role/{__init__.py,eac3.py,role.py} from the iclforge repository,
+commit b1968ea5a35e57f093f4b17a29dd18be87f33c0c. Do not edit here: change it there and run scripts/vendor_ma_role.py.

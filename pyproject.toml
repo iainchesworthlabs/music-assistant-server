@@ -113,6 +113,9 @@ show-fixes = true
 
 line-length = 100
 target-version = "py314"
+# verbatim copy from the iclforge repository, see its VENDORED.txt
+extend-exclude = ["music_assistant/providers/sendspin/ma_role"]
+force-exclude = true
 
 [tool.ruff.lint.pydocstyle]
 # Use Sphinx-style docstrings with :param: syntax
@@ -156,6 +159,7 @@ enable_error_code = [
 ]
 exclude = [
   '^music_assistant/providers/sonic_analysis/vendored_clap/.*$',
+  '^music_assistant/providers/sendspin/ma_role/.*$',
 ]
 extra_checks = false
 local_partial_types = true
