@@ -1793,7 +1793,7 @@ class StreamsAudio:
         streamdetails = queue_item.streamdetails
         if streamdetails is None or not is_coded_passthrough_candidate(streamdetails):
             raise AudioError(f"{queue_item.name} cannot be streamed as a coded stream")
-        assert streamdetails.path  # for type checking
+        assert isinstance(streamdetails.path, str)  # for type checking
         streamdetails.stream_error = False
         self.logger.getChild("queue_item_stream").log(
             VERBOSE_LOG_LEVEL,

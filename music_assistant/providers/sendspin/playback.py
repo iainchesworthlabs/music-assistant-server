@@ -29,9 +29,10 @@ from music_assistant.providers.sendspin.bridge_role import (
     BRIDGE_SAMPLE_RATE,
     BridgePlayerRole,
 )
+from music_assistant.providers.sendspin.coded import CodedTap, build_coded_tap
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import AsyncGenerator, Iterable
 
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -300,6 +301,7 @@ class SendspinPlaybackSession:
         self._members: set[str] = set()
         self._member_pipelines: dict[str, _MemberPipeline] = {}
         self._push_stream: PushStream | None = None
+        self._coded_tap: CodedTap | None = None
         self._playback_running = False
         self._producer_eof_sent = False
         self._timeline_start_us: int | None = None
@@ -734,6 +736,14 @@ class SendspinPlaybackSession:
                 "Sendspin session PCM format: %d Hz / F32",
                 self._pcm_format.sample_rate,
             )
+            # coded members change role before the group's first commit; the tap is None for
+            # an item (or group) that has no coded member
+            self._coded_tap = await build_coded_tap(
+                self.player.logger,
+                self.player.api.group.clients,
+                self._start_streamdetails,
+                int(self._start_streamdetails.seek_position) if self._start_streamdetails else 0,
+            )
             push_stream = self._create_push_stream()
             push_stream.set_live_source(self._is_live_source(media))
             async with self._state_lock:
@@ -745,6 +755,9 @@ class SendspinPlaybackSession:
                 self._timeline_start_us = None
                 self._first_commit_monotonic_us = None
                 self._mapping_dirty = True
+            if self._coded_tap is not None:
+                self.player.logger.info("Coded variants: %s", self._coded_tap.variants)
+                await self._coded_tap.prepare()
         except Exception:
             # A track change stops the previous stream without stream/end, so a failed
             # setup has to end this one. Cancellation propagates untouched, since there
@@ -752,6 +765,7 @@ class SendspinPlaybackSession:
             if push_stream is not None:
                 with suppress(Exception):
                     push_stream.stop()
+            await self._close_coded_tap()
             await self._reset_session_state()
             raise
         # Bounded queue between producer (stream reader) and consumer (committer).
@@ -765,9 +779,7 @@ class SendspinPlaybackSession:
 
         async def _produce_pending_chunks() -> None:
             nonlocal pending_duration_us
-            audio_source = self.player.mass.streams.get_stream(
-                media, self._pcm_format, self.player.player_id
-            )
+            audio_source = self._get_audio_source(media)
             completed = False
             try:
                 async for chunk in audio_source:
@@ -870,6 +882,10 @@ class SendspinPlaybackSession:
                     break
                 await push_stream.sleep_to_limit_buffer(_PRODUCER_BUFFER_LIMIT_US)
                 commit_now_us = push_stream.now_us()
+                if self._coded_tap is not None:
+                    await self._coded_tap.on_commit(
+                        int(commit_start_us), pending.duration_us, commit_now_us
+                    )
                 committed_history_chunk = _HistoryChunk(
                     start_time_us=int(commit_start_us),
                     duration_us=pending.duration_us,
@@ -945,6 +961,7 @@ class SendspinPlaybackSession:
                     # non-clean stop so we skip group.stop() below
                     # and let the new playback handle the transition.
                     producer_stopped_cleanly = False
+            await self._close_coded_tap()
             with suppress(Exception):
                 # Same condition as the group.stop() below, so we snapshot on exactly the
                 # paths where a group STOP is already emitted. That stop resets the reported
@@ -1453,6 +1470,37 @@ class SendspinPlaybackSession:
         if keep_stream:
             ps.clear()
         ps.stop(keep_stream=keep_stream)
+
+    async def _close_coded_tap(self) -> None:
+        """End the coded streams of the session, if it had any."""
+        tap, self._coded_tap = self._coded_tap, None
+        if tap is not None:
+            with suppress(Exception):
+                await tap.close()
+
+    def _get_audio_source(self, media: PlayerMedia) -> AsyncGenerator[bytes]:
+        """
+        Return the PCM stream of the session.
+
+        A session with a coded tap plays its single item instead of the queue flow: the coded
+        bursts are stamped from the item's start, so the PCM stream must be that item alone.
+        """
+        streams = self.player.mass.streams
+        queue_item = (
+            self.player.mass.player_queues.get_item(media.source_id, media.queue_item_id)
+            if self._coded_tap is not None and media.source_id and media.queue_item_id
+            else None
+        )
+        if queue_item is None:
+            return streams.get_stream(media, self._pcm_format, self.player.player_id)
+        return streams.audio.get_queue_item_stream(
+            queue_item=queue_item,
+            pcm_format=self._pcm_format,
+            seek_position=int(queue_item.streamdetails.seek_position)
+            if queue_item.streamdetails
+            else 0,
+            session_id=get_media_session_id(media),
+        )
 
     async def _reset_session_state(self) -> None:
         """Drop all per-session playback state so the next session starts clean."""

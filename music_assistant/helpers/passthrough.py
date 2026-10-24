@@ -120,6 +120,7 @@ async def get_eac3_demux_stream(
     path: str,
     seek_position: float = 0,
     access_units_per_chunk: int = _EAC3_DEMUX_CHUNK_ACCESS_UNITS,
+    stereo_bit_rate: int | None = None,
 ) -> AsyncGenerator[bytes]:
     """
     Demux the audio of a file to a raw E-AC-3 stream without decoding it.
@@ -128,15 +129,24 @@ async def get_eac3_demux_stream(
     buffering, the bitstream (including any Atmos extension data) stays untouched.
     Every yielded chunk holds whole access units.
 
+    With ``stereo_bit_rate`` the audio is instead folded down to two channels and
+    encoded again as E-AC-3 (for players that cannot take more than two coded
+    channels). That is a lossy second generation without objects.
+
     :param path: Local file with an E-AC-3 audio stream (raw .ec3 or MP4).
     :param seek_position: Start position in seconds.
     :param access_units_per_chunk: Access units per yielded chunk.
+    :param stereo_bit_rate: Re-encode to stereo at this bit rate (bit/s) instead of copying.
     """
     args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
     if seek_position:
         args += ["-ss", f"{seek_position:.3f}"]
-    args += ["-i", path, "-vn", "-dn", "-sn", "-map", "0:a:0", "-c:a", "copy", "-f", "eac3"]
-    args += ["pipe:1"]
+    args += ["-i", path, "-vn", "-dn", "-sn", "-map", "0:a:0"]
+    if stereo_bit_rate:
+        args += ["-ac", "2", "-c:a", "eac3", "-b:a", str(stereo_bit_rate)]
+    else:
+        args += ["-c:a", "copy"]
+    args += ["-f", "eac3", "pipe:1"]
     async with AsyncProcess(args, stdout=True, stderr=False, name="ffmpeg-demux") as proc:
         pending: list[bytes] = []
         async for unit in iter_eac3_access_units(proc.iter_any()):
