@@ -144,6 +144,8 @@ TRACK_EXTENSIONS = {
     "m2ts",
     "mp+",
 }
+# raw E-AC-3 elementary streams (Dolby Digital Plus / Atmos), ffprobe names the codec eac3
+RAW_EAC3_EXTENSIONS = {"ec3", "eac3"}
 PLAYLIST_EXTENSIONS = {"m3u", "pls", "m3u8"}
 CUE_EXTENSIONS = {"cue"}
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif"}

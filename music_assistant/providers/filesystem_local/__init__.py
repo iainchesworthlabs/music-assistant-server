@@ -118,6 +118,7 @@ from .constants import (
     PARTIAL_LISTING_CACHE_EXPIRATION,
     PLAYLIST_EXTENSIONS,
     PODCAST_EPISODE_EXTENSIONS,
+    RAW_EAC3_EXTENSIONS,
     SOUND_EFFECT_EXTENSIONS,
     TRACK_EXTENSIONS,
     WALK_EXTENSIONS,
@@ -2420,6 +2421,13 @@ class LocalFileSystemProvider(MusicProvider):
         return relative_path
 
     @staticmethod
+    def _content_type_for_file(file_item: FileSystemItem, tags: AudioTags) -> ContentType:
+        """Return the content type of a file, treating a raw .ec3 file as E-AC-3."""
+        if file_item.ext in RAW_EAC3_EXTENSIONS:
+            return ContentType.EAC3
+        return ContentType.try_parse(file_item.ext or tags.format)
+
+    @staticmethod
     def _codec_type_from_tags(tags: AudioTags) -> ContentType:
         """Return the audio codec detected by ffprobe, if any."""
         if tags.raw and (streams := tags.raw.get("streams")):
@@ -2452,7 +2460,7 @@ class LocalFileSystemProvider(MusicProvider):
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                     audio_format=AudioFormat(
-                        content_type=ContentType.try_parse(file_item.ext or tags.format),
+                        content_type=self._content_type_for_file(file_item, tags),
                         codec_type=self._codec_type_from_tags(tags),
                         sample_rate=tags.sample_rate,
                         bit_depth=tags.bits_per_sample,

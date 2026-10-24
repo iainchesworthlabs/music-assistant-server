@@ -142,6 +142,11 @@ from music_assistant.helpers.ffmpeg import (
     get_ffmpeg_stream,
 )
 from music_assistant.helpers.named_pipe import read_named_pipe
+from music_assistant.helpers.passthrough import (
+    PassthroughStreamError,
+    get_eac3_demux_stream,
+    is_coded_passthrough_candidate,
+)
 from music_assistant.helpers.playlists import (
     HLS_CONTENT_TYPES,
     PLAYLIST_CONTENT_TYPES,
@@ -1766,6 +1771,42 @@ class StreamsAudio:
                 seconds_streamed,
             )
             self._notify_provider_streamed(streamdetails, finished, seconds_streamed)
+
+    async def get_queue_item_passthrough_stream(
+        self,
+        queue_item: QueueItem,
+        seek_position: float = 0,
+    ) -> AsyncGenerator[bytes]:
+        """
+        Get the coded (undecoded) audio stream for a single queue item.
+
+        Unlike :meth:`get_queue_item_stream` nothing is decoded: the file is only demuxed,
+        so volume normalization, fades, playback speed and the PCM buffer do not apply.
+        Every chunk holds whole E-AC-3 access units.
+
+        TODO: the Sendspin coded role consumes this; nothing calls it yet.
+
+        :param queue_item: The queue item, its streamdetails must be a passthrough candidate.
+        :param seek_position: Start position in seconds.
+        :raises AudioError: If the item cannot be passed through as a coded stream.
+        """
+        streamdetails = queue_item.streamdetails
+        if streamdetails is None or not is_coded_passthrough_candidate(streamdetails):
+            raise AudioError(f"{queue_item.name} cannot be streamed as a coded stream")
+        assert streamdetails.path  # for type checking
+        streamdetails.stream_error = False
+        self.logger.getChild("queue_item_stream").log(
+            VERBOSE_LOG_LEVEL,
+            "Starting coded passthrough stream for %s (%s)",
+            queue_item.name,
+            streamdetails.uri,
+        )
+        try:
+            async for chunk in get_eac3_demux_stream(streamdetails.path, seek_position):
+                yield chunk
+        except (PassthroughStreamError, OSError) as err:
+            streamdetails.stream_error = True
+            raise AudioError(f"Coded passthrough of {queue_item.name} failed: {err}") from err
 
     async def get_queue_item_stream_with_smartfade(
         self,
