@@ -120,6 +120,7 @@ async def test_supported_stream_gets_a_coded_lane(modes: list[tuple[str, str]]) 
 
 class _FakeRole:
     stream_started = True
+    support = None
 
     def __init__(self) -> None:
         self.sent = 0
@@ -229,3 +230,28 @@ async def test_demux_sends_what_the_committed_timeline_already_covers(
     await tap._demux(lane)
     expected = len(eac3.build_bursts(EAC3.read_bytes()))
     assert role.sent == expected > 20
+
+
+async def test_sending_stays_inside_the_buffer_the_board_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A board drops what does not fit its buffer, so the tap only sends a share of it ahead."""
+    support = iclforge_role.parse_support(
+        {"data_types": ["eac3"], "sample_rates": [48000], "buffer_capacity": 261_120}
+    )
+    role = _FakeRole()
+    role.support = support  # type: ignore[assignment]
+    monkeypatch.setattr(coded, "coded_role", lambda _client: role)
+    lane = _Lane(variant=CodedVariant.FULL, clients=[SimpleNamespace(client_id="kit")])  # type: ignore[list-item]
+    for _ in range(90):
+        lane.queue.put_nowait(eac3.Burst(payload=b"\0" * 3072))
+    tap = CodedTap(logging.getLogger("t"), "x.ec3", 0, 6, 48000, [lane], [])
+    # the whole item is committed and the first burst is 0.5 s away
+    await tap.on_commit(500_000, 60_000_000, 0)
+    horizon_bursts = int(0.6 * 261_120 // (3072 + 17)) + 1
+    assert 0 < role.sent <= horizon_bursts
+    assert role.sent < 90
+    # the clock moves on and the rest may go out
+    tap._clock_anchor = (2_000_000, tap._clock_anchor[1])  # type: ignore[index]
+    tap._send_due(lane)
+    assert role.sent == 90

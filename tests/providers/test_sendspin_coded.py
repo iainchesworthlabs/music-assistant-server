@@ -75,6 +75,7 @@ class _FakeRole:
     """Records the bursts a lane sends."""
 
     stream_started = True
+    support = None
 
     def __init__(self) -> None:
         self.sent: list[tuple[int, int]] = []

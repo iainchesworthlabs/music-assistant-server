@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -52,6 +53,10 @@ STATE_TIMEOUT_S = 10.0
 STEREO_BIT_RATE = 192_000
 # added to the largest required lead time of the coded members for the first burst's timestamp
 CODED_LEAD_MARGIN_US = 300_000
+# a board buffers bursts only up to its stated buffer_capacity, and drops what does not fit: the
+# tap sends no further ahead of the clock than this share of what the buffer holds
+BUFFER_FILL_SHARE = 0.6
+SENDER_INTERVAL_S = 0.02
 # bursts demuxed ahead of the timeline, per variant (32 ms each)
 _BURST_QUEUE_SIZE = 96
 
@@ -150,6 +155,7 @@ class _Lane:
     held: eac3.Burst | None = None
     error: str | None = None
     handled: bool = False
+    finished: bool = False
 
 
 class CodedTap:
@@ -176,6 +182,8 @@ class CodedTap:
         self._timeline_start_us: int | None = None
         self._produced_us = 0
         self.first_lead_us: int | None = None
+        self._clock_anchor: tuple[int, float] | None = None
+        self._sender: asyncio.Task[None] | None = None
 
     @property
     def variants(self) -> dict[str, str]:
@@ -207,6 +215,7 @@ class CodedTap:
         for lane in self._lanes:
             lane.task = asyncio.create_task(self._demux(lane))
             lane.task.add_done_callback(self._log_task_end)
+        self._sender = asyncio.create_task(self._send_loop())
 
     def first_play_start_us(self, now_us: int, natural_floor_us: int = 0) -> int:
         """
@@ -231,6 +240,7 @@ class CodedTap:
         :param duration_us: Duration of the committed PCM.
         :param now_us: The server clock now, to report the lead of the first burst.
         """
+        self._clock_anchor = (now_us, time.monotonic())
         if self._timeline_start_us is None:
             self._timeline_start_us = commit_start_us
             self.first_lead_us = commit_start_us - now_us
@@ -253,6 +263,10 @@ class CodedTap:
 
         :param drain: Send what is still queued first (end of the item), else drop it.
         """
+        if self._sender is not None:
+            self._sender.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._sender
         for lane in self._lanes:
             if lane.task is not None:
                 lane.task.cancel()
@@ -288,12 +302,15 @@ class CodedTap:
                 except asyncio.QueueEmpty:
                     return
             if burst is None:
+                lane.finished = True
                 return
             offset_us = lane.next_samples * 1_000_000 // self._sample_rate
-            if offset_us >= self._produced_us:
+            stamp = self._timeline_start_us + offset_us
+            if offset_us >= self._produced_us or stamp - self._now_us() > self._horizon_us(
+                lane, len(burst.payload)
+            ):
                 lane.held = burst
                 return
-            stamp = self._timeline_start_us + offset_us
             for client in lane.clients:
                 role = coded_role(client)
                 if role is not None and role.stream_started:
@@ -305,6 +322,38 @@ class CodedTap:
             lane.next_samples += burst.samples
             lane.sent += 1
             lane.sent_bytes += len(burst.payload)
+
+    def _now_us(self) -> int:
+        """Return the server clock now, extrapolated from the last commit."""
+        if self._clock_anchor is None:
+            return 0
+        anchor_us, anchor_s = self._clock_anchor
+        return anchor_us + int((time.monotonic() - anchor_s) * 1_000_000)
+
+    def _horizon_us(self, lane: _Lane, payload_bytes: int) -> int:
+        """
+        Return how far ahead of the clock a lane may send.
+
+        A share of what the smallest buffer among its members holds; unlimited when no member
+        states a capacity.
+        """
+        horizon = 1 << 62
+        for client in lane.clients:
+            if (role := coded_role(client)) is None or role.support is None:
+                continue
+            capacity = role.support.buffer_capacity
+            bursts = max(1, capacity // (payload_bytes + eac3.BURST_HEADER_BYTES))
+            horizon = min(
+                horizon, int(bursts * 1_000_000 * 1536 / self._sample_rate * BUFFER_FILL_SHARE)
+            )
+        return horizon
+
+    async def _send_loop(self) -> None:
+        """Send queued bursts as the clock moves, until every lane has run dry."""
+        while not all(lane.finished or lane.error is not None for lane in self._lanes):
+            for lane in self._lanes:
+                self._send_due(lane)
+            await asyncio.sleep(SENDER_INTERVAL_S)
 
     async def _demux(self, lane: _Lane) -> None:
         """Feed a lane's queue with bursts built from the item's access units."""
