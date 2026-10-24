@@ -33,6 +33,7 @@ from music_assistant.helpers.passthrough import (
     get_eac3_demux_stream,
     is_coded_passthrough_candidate,
     iter_eac3_access_units,
+    probe_eac3_stream,
 )
 
 from .ma_role import eac3
@@ -49,11 +50,45 @@ DATA_TYPE = "eac3"
 CODED_START_HOLD_S = 2.5
 STATE_TIMEOUT_S = 10.0
 STEREO_BIT_RATE = 192_000
+# added to the largest required lead time of the coded members for the first burst's timestamp
+CODED_LEAD_MARGIN_US = 300_000
 # bursts demuxed ahead of the timeline, per variant (32 ms each)
 _BURST_QUEUE_SIZE = 96
 
 # the one place the role is registered: importing this module is enough
 iclforge_role.register()
+
+
+def coded_start_lead_us(
+    required_lead_us: Iterable[int], margin_us: int = CODED_LEAD_MARGIN_US
+) -> int:
+    """
+    Return how far ahead of now a coded stream starts: the largest required lead plus a margin.
+
+    :param required_lead_us: The required lead time of every coded member, in microseconds.
+    :param margin_us: Headroom for send stalls and network jitter.
+    """
+    return max(required_lead_us, default=0) + margin_us
+
+
+def first_play_start_us(
+    now_us: int,
+    required_lead_us: Iterable[int],
+    natural_floor_us: int = 0,
+    margin_us: int = CODED_LEAD_MARGIN_US,
+) -> int:
+    """
+    Return the timeline timestamp of the group's first commit when it has coded members.
+
+    The PCM members keep at least their own lead (``natural_floor_us``, what the push stream would
+    have used); the coded ones decide when theirs is larger.
+
+    :param now_us: The server clock now.
+    :param required_lead_us: The required lead time of every coded member.
+    :param natural_floor_us: The lead the push stream would use without coded members.
+    :param margin_us: Headroom for the coded members.
+    """
+    return now_us + max(coded_start_lead_us(required_lead_us, margin_us), natural_floor_us)
 
 
 class CodedVariant(StrEnum):
@@ -113,6 +148,8 @@ class _Lane:
     sent_bytes: int = 0
     next_samples: int = 0
     held: eac3.Burst | None = None
+    error: str | None = None
+    handled: bool = False
 
 
 class CodedTap:
@@ -171,6 +208,21 @@ class CodedTap:
             lane.task = asyncio.create_task(self._demux(lane))
             lane.task.add_done_callback(self._log_task_end)
 
+    def first_play_start_us(self, now_us: int, natural_floor_us: int = 0) -> int:
+        """
+        Return the play start to give the group's first commit.
+
+        :param now_us: The server clock now.
+        :param natural_floor_us: The lead the push stream would use without coded members.
+        """
+        required = [
+            role.get_required_lead_time_us()
+            for lane in self._lanes
+            for client in lane.clients
+            if (role := coded_role(client)) is not None
+        ]
+        return first_play_start_us(now_us, required, natural_floor_us)
+
     async def on_commit(self, commit_start_us: int, duration_us: int, now_us: int) -> None:
         """
         Send the bursts that start inside the PCM span just committed.
@@ -189,7 +241,11 @@ class CodedTap:
             )
         self._produced_us += duration_us
         for lane in self._lanes:
-            await self._send_due(lane)
+            if lane.error is None:
+                self._send_due(lane)
+            if lane.error is not None and not lane.handled:
+                lane.handled = True
+                await self._fail_lane(lane)
 
     async def close(self, *, drain: bool = False) -> None:
         """
@@ -205,7 +261,7 @@ class CodedTap:
             if drain:
                 self._produced_us = 1 << 62
                 with contextlib.suppress(Exception):
-                    await self._send_due(lane)
+                    self._send_due(lane)
             self._logger.info(
                 "Coded %s lane: %d bursts, %d bytes, first burst %s ms ahead, to %s",
                 lane.variant.value,
@@ -219,9 +275,10 @@ class CodedTap:
                     with contextlib.suppress(Exception):
                         role.end_stream()
 
-    async def _send_due(self, lane: _Lane) -> None:
+    def _send_due(self, lane: _Lane) -> None:
         """Send queued bursts of a lane whose start lies inside the committed timeline."""
-        assert self._timeline_start_us is not None
+        if self._timeline_start_us is None or lane.error is not None:
+            return
         while True:
             burst = lane.held
             lane.held = None
@@ -240,7 +297,11 @@ class CodedTap:
             for client in lane.clients:
                 role = coded_role(client)
                 if role is not None and role.stream_started:
-                    role.send_burst(burst, stamp)
+                    try:
+                        role.send_burst(burst, stamp)
+                    except (iclforge_role.RoleError, ConnectionError, OSError) as err:
+                        lane.error = f"sending to {client.client_id} failed: {err}"
+                        return
             lane.next_samples += burst.samples
             lane.sent += 1
             lane.sent_bytes += len(burst.payload)
@@ -255,12 +316,45 @@ class CodedTap:
         try:
             async for unit in iter_eac3_access_units(_chunks_of(stream)):
                 if (burst := builder.push(unit)) is not None:
+                    # the commits may all be done by now (a short item is committed in one go),
+                    # so the demux also sends what the committed timeline already covers
+                    self._send_due(lane)
                     await lane.queue.put(burst)
+                    self._send_due(lane)
         except (PassthroughStreamError, eac3.Eac3Error) as err:
-            self._logger.error("Coded %s stream of %s broke: %s", lane.variant, self._path, err)
+            lane.error = f"the {lane.variant.value} stream of {self._path} broke: {err}"
         finally:
             await lane.queue.put(None)
             await stream.aclose()
+
+    async def _fail_lane(self, lane: _Lane) -> None:
+        """
+        Move a lane's members to the PCM channel for the rest of the item.
+
+        The members leave coded mode, which re-activates their ``player@v1``; the push stream
+        takes them in as late joiners (it replays the PCM it still holds).
+        """
+        members = [client.client_id for client in lane.clients]
+        self._logger.error(
+            "Coded %s lane failed for %s: %s. Switching them to PCM for the rest of the item.",
+            lane.variant.value,
+            members,
+            lane.error,
+        )
+        for client in lane.clients:
+            if (role := coded_role(client)) is not None:
+                with contextlib.suppress(Exception):
+                    role.end_stream()
+            try:
+                await iclforge_role.set_mode(client, "pcm")
+            except (iclforge_role.RoleError, TimeoutError) as err:
+                self._logger.error(
+                    "%s could not be switched to PCM (%s), it recovers with the next item",
+                    client.client_id,
+                    err,
+                )
+        self.pcm_clients.extend(lane.clients)
+        lane.clients = []
 
     def _log_task_end(self, task: asyncio.Task[None]) -> None:
         if not task.cancelled() and (err := task.exception()):
@@ -301,6 +395,14 @@ async def build_coded_tap(
         audio_format.codec_type,
     }:
         candidate = False
+    if candidate and streamdetails is not None and isinstance(streamdetails.path, str):
+        if reason := await probe_eac3_stream(streamdetails.path, seek_position):
+            logger.warning(
+                "%s is not passed through as a coded stream (%s): every member gets PCM",
+                streamdetails.path,
+                reason,
+            )
+            candidate = False
     by_variant: dict[CodedVariant, list[SendspinClient]] = {v: [] for v in CodedVariant}
     for client in clients:
         support = client_support(client)

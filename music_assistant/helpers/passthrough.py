@@ -156,3 +156,41 @@ async def get_eac3_demux_stream(
                 pending = []
         if pending:
             yield b"".join(pending)
+
+
+_EAC3_BSID_BYTE = 5
+_EAC3_PROBE_ACCESS_UNITS = 4
+_EAC3_MIN_BSID = 11
+
+
+async def probe_eac3_stream(path: str, seek_position: float = 0) -> str | None:
+    """
+    Check the first syncframes of a file before it is promised to a player as a coded stream.
+
+    Only E-AC-3 proper (``bsid`` 11 to 16) is packed into bursts; an AC-3 stream, or an AC-3 core
+    with E-AC-3 extension substreams, would break the lane midway.
+
+    :param path: Local file with an E-AC-3 audio stream.
+    :param seek_position: Start position in seconds.
+    :return: None if the stream can be passed through, else why not.
+    """
+    stream = get_eac3_demux_stream(path, seek_position, _EAC3_PROBE_ACCESS_UNITS)
+    try:
+        head = await anext(stream, b"")
+    except (PassthroughStreamError, OSError) as err:
+        return f"the demux failed: {err}"
+    finally:
+        await stream.aclose()
+    if not head:
+        return "the file has no E-AC-3 audio stream that ffmpeg can demux"
+    pos = 0
+    while pos + _EAC3_HEADER_SIZE + 1 <= len(head):
+        try:
+            size, _ = parse_eac3_syncframe_header(head[pos : pos + _EAC3_HEADER_SIZE])
+        except PassthroughStreamError as err:
+            return str(err)
+        bsid = head[pos + _EAC3_BSID_BYTE] >> 3
+        if not _EAC3_MIN_BSID <= bsid <= _EAC3_BSID:
+            return f"a syncframe has bsid {bsid}, only E-AC-3 (bsid 11 to 16) is passed through"
+        pos += size
+    return None

@@ -875,7 +875,9 @@ class SendspinPlaybackSession:
                         channel_id=pipeline.channel_id,
                     )
                 try:
-                    commit_start_us = await push_stream.commit_audio()
+                    commit_start_us = await push_stream.commit_audio(
+                        play_start_us=self._first_commit_play_start_us(push_stream)
+                    )
                 except StreamStoppedError:
                     # Stream stopped since it was replaced by another stream
                     self.player.logger.debug("Stopping commit loop due to stopped push stream")
@@ -1470,6 +1472,18 @@ class SendspinPlaybackSession:
         if keep_stream:
             ps.clear()
         ps.stop(keep_stream=keep_stream)
+
+    def _first_commit_play_start_us(self, push_stream: PushStream) -> int | None:
+        """
+        Return the explicit play start of the first commit of a session with coded members.
+
+        The coded members' lead (their required lead time plus a margin) decides when it is larger
+        than the one the push stream would use; later commits continue that timeline.
+        """
+        if self._coded_tap is None or self._timeline_start_us is not None:
+            return None
+        floor_us = getattr(push_stream, "_min_send_ahead_us", lambda: 0)()
+        return self._coded_tap.first_play_start_us(push_stream.now_us(), floor_us)
 
     async def _close_coded_tap(self) -> None:
         """End the coded streams of the session, if it had any."""
