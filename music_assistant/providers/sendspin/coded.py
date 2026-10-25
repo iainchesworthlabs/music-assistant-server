@@ -25,7 +25,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiosendspin.models import AudioCodec
 from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
@@ -43,7 +43,7 @@ from .ma_role import eac3
 from .ma_role import role as iclforge_role
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Iterable
+    from collections.abc import AsyncGenerator, Coroutine, Iterable
 
     from aiosendspin.models.player import SupportedAudioFormat
     from aiosendspin.server.client import SendspinClient
@@ -52,7 +52,12 @@ if TYPE_CHECKING:
 DATA_TYPE = "eac3"
 # the sink holds a coded start until its clock converged (about 2 s after activation)
 CODED_START_HOLD_S = 2.5
-STATE_TIMEOUT_S = 10.0
+# bursts every lane must have ready before the first commit, and how long to wait for them
+PRIME_BURSTS = 24
+PRIME_TIMEOUT_S = 3.0
+# nothing in the teardown of a tap may wait longer than this
+CLOSE_TIMEOUT_S = 1.5
+STATE_TIMEOUT_S = 3.0
 # a board that decodes 15-object material at 192 kb/s stereo at its limit (the C6) gets less to chew
 STEREO_BIT_RATE = 128_000
 # the push stream cuts PCM into 25 ms chunks; a board states the largest message it takes
@@ -124,6 +129,24 @@ def fit_chunk_limit(
                 wanted,
             )
     return preferred
+
+
+# monotonic time at which each client's coded role was activated by this module
+_ACTIVATED_AT: dict[str, float] = {}
+
+
+def remaining_hold_s(activation_ages_s: Iterable[float], hold_s: float | None = None) -> float:
+    """
+    Return how much longer the first commit has to wait for the sinks' clocks to converge.
+
+    A sink holds a coded start until its clock converged, about ``hold_s`` after its role was
+    activated; a role that has been active that long (a second coded item in a row) needs no hold.
+
+    :param activation_ages_s: Seconds since each coded member's role was activated.
+    :param hold_s: The convergence time.
+    """
+    hold = CODED_START_HOLD_S if hold_s is None else hold_s
+    return max((max(0.0, hold - age) for age in activation_ages_s), default=0.0)
 
 
 def coded_start_lead_us(
@@ -207,7 +230,7 @@ class _Lane:
 
     variant: CodedVariant
     clients: list[SendspinClient]
-    queue: asyncio.Queue[eac3.Burst | None] = field(
+    queue: asyncio.Queue[eac3.Burst] = field(
         default_factory=lambda: asyncio.Queue(maxsize=_BURST_QUEUE_SIZE)
     )
     task: asyncio.Task[None] | None = None
@@ -218,6 +241,8 @@ class _Lane:
     error: str | None = None
     handled: bool = False
     finished: bool = False
+    demux_done: bool = False
+    bad_clients: list[tuple[SendspinClient, str]] = field(default_factory=list)
 
 
 class CodedTap:
@@ -248,6 +273,7 @@ class CodedTap:
         self.first_lead_us: int | None = None
         self._clock_anchor: tuple[int, float] | None = None
         self._sender: asyncio.Task[None] | None = None
+        self._background: set[asyncio.Task[None]] = set()
 
     @property
     def variants(self) -> dict[str, str]:
@@ -265,21 +291,66 @@ class CodedTap:
 
         :raises TimeoutError: If a member's role never reports its state.
         """
-        roles = [
-            (lane, client, coded_role(client)) for lane in self._lanes for client in lane.clients
-        ]
-        for _, client, role in roles:
-            if role is None:
-                raise iclforge_role.RoleError(f"{client.client_id}: coded role not active")
-            await role.wait_for_state(STATE_TIMEOUT_S)
-        await asyncio.sleep(CODED_START_HOLD_S)
-        for _, _, role in roles:
-            assert role is not None  # for type checking
-            role.start_stream(DATA_TYPE, self._sample_rate)
+        # the demux starts at once: its cold start overlaps the hold instead of following it
         for lane in self._lanes:
             lane.task = asyncio.create_task(self._demux(lane))
             lane.task.add_done_callback(self._log_task_end)
+        # a member whose role never reports its state (gone, or stuck) must not hold the group up
+        for lane in self._lanes:
+            for client in list(lane.clients):
+                role = coded_role(client)
+                try:
+                    if role is None:
+                        raise iclforge_role.RoleError("coded role not active")
+                    await role.wait_for_state(STATE_TIMEOUT_S)
+                except (iclforge_role.RoleError, TimeoutError) as err:
+                    self._drop_client(lane, client, f"its coded role is not ready: {err!r}")
+        if not any(lane.clients for lane in self._lanes):
+            raise iclforge_role.RoleError("no member is ready for the coded stream")
+        now = time.monotonic()
+        ages = [
+            now - _ACTIVATED_AT.get(client.client_id, now - CODED_START_HOLD_S)
+            for lane in self._lanes
+            for client in lane.clients
+        ]
+        if (hold := remaining_hold_s(ages)) > 0:
+            await asyncio.sleep(hold)
+        await self._prime()
+        for lane in self._lanes:
+            for client in lane.clients:
+                if (role := coded_role(client)) is not None:
+                    role.start_stream(DATA_TYPE, self._sample_rate)
         self._sender = asyncio.create_task(self._send_loop())
+
+    async def _prime(self) -> None:
+        """Wait until every lane has its first bursts ready, so none starts behind its slot."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + PRIME_TIMEOUT_S
+        while loop.time() < deadline:
+            if all(
+                lane.queue.qsize() >= PRIME_BURSTS or lane.demux_done or lane.error is not None
+                for lane in self._lanes
+            ):
+                return
+            await asyncio.sleep(0.02)
+        self._logger.warning(
+            "Coded lanes not primed after %.1f s: %s",
+            PRIME_TIMEOUT_S,
+            {lane.variant.value: lane.queue.qsize() for lane in self._lanes},
+        )
+
+    def _drop_client(self, lane: _Lane, client: SendspinClient, reason: str) -> None:
+        """Take one member out of a lane and give it the PCM channel (in the background)."""
+        if client not in lane.clients:
+            return
+        lane.clients.remove(client)
+        self._logger.error(
+            "Coded %s lane: %s dropped (%s). Switching it to PCM for the rest of the item.",
+            lane.variant.value,
+            client.client_id,
+            reason,
+        )
+        self._spawn(self._to_pcm([client]))
 
     def first_play_start_us(self, now_us: int, natural_floor_us: int = 0) -> int:
         """
@@ -315,11 +386,8 @@ class CodedTap:
             )
         self._produced_us += duration_us
         for lane in self._lanes:
-            if lane.error is None:
-                self._send_due(lane)
-            if lane.error is not None and not lane.handled:
-                lane.handled = True
-                await self._fail_lane(lane)
+            self._send_due(lane)
+            self._handle_failures(lane)
 
     async def close(self, *, drain: bool = False) -> None:
         """
@@ -327,15 +395,18 @@ class CodedTap:
 
         :param drain: Send what is still queued first (end of the item), else drop it.
         """
-        if self._sender is not None:
-            self._sender.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._sender
+        tasks = [t for t in (self._sender, *(lane.task for lane in self._lanes)) if t is not None]
+        tasks.extend(self._background)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            # never wait unbounded: a stuck ffmpeg or send must not hold the session's lock
+            _, pending = await asyncio.wait(tasks, timeout=CLOSE_TIMEOUT_S)
+            if pending:
+                self._logger.warning(
+                    "%d coded task(s) did not stop within %.1f s", len(pending), CLOSE_TIMEOUT_S
+                )
         for lane in self._lanes:
-            if lane.task is not None:
-                lane.task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await lane.task
             if drain:
                 self._produced_us = 1 << 62
                 with contextlib.suppress(Exception):
@@ -355,7 +426,7 @@ class CodedTap:
 
     def _send_due(self, lane: _Lane) -> None:
         """Send queued bursts of a lane whose start lies inside the committed timeline."""
-        if self._timeline_start_us is None or lane.error is not None:
+        if self._timeline_start_us is None or lane.error is not None or lane.finished:
             return
         while True:
             burst = lane.held
@@ -364,10 +435,8 @@ class CodedTap:
                 try:
                     burst = lane.queue.get_nowait()
                 except asyncio.QueueEmpty:
+                    lane.finished = lane.demux_done
                     return
-            if burst is None:
-                lane.finished = True
-                return
             offset_us = lane.next_samples * 1_000_000 // self._sample_rate
             stamp = self._timeline_start_us + offset_us
             if offset_us >= self._produced_us or stamp - self._now_us() > self._horizon_us(
@@ -375,14 +444,19 @@ class CodedTap:
             ):
                 lane.held = burst
                 return
-            for client in lane.clients:
+            for client in list(lane.clients):
                 role = coded_role(client)
-                if role is not None and role.stream_started:
+                if role is None:
+                    # the member is gone (disconnected or moved on): the lane carries on without it
+                    lane.bad_clients.append((client, "its coded role is gone"))
+                    lane.clients.remove(client)
+                    continue
+                if role.stream_started:
                     try:
                         role.send_burst(burst, stamp)
                     except (iclforge_role.RoleError, ConnectionError, OSError) as err:
-                        lane.error = f"sending to {client.client_id} failed: {err}"
-                        return
+                        lane.bad_clients.append((client, f"sending failed: {err}"))
+                        lane.clients.remove(client)
             lane.next_samples += burst.samples
             lane.sent += 1
             lane.sent_bytes += len(burst.payload)
@@ -417,6 +491,7 @@ class CodedTap:
         while not all(lane.finished or lane.error is not None for lane in self._lanes):
             for lane in self._lanes:
                 self._send_due(lane)
+                self._handle_failures(lane)
             await asyncio.sleep(SENDER_INTERVAL_S)
 
     async def _demux(self, lane: _Lane) -> None:
@@ -437,37 +512,65 @@ class CodedTap:
         except (PassthroughStreamError, eac3.Eac3Error) as err:
             lane.error = f"the {lane.variant.value} stream of {self._path} broke: {err}"
         finally:
-            await lane.queue.put(None)
-            await stream.aclose()
+            # no await on the queue here: it may be full and the task may be cancelled
+            lane.demux_done = True
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(stream.aclose(), CLOSE_TIMEOUT_S)
 
-    async def _fail_lane(self, lane: _Lane) -> None:
+    def _handle_failures(self, lane: _Lane) -> None:
         """
-        Move a lane's members to the PCM channel for the rest of the item.
+        Act on what went wrong in a lane, without ever waiting here (this runs in the commit loop).
 
-        The members leave coded mode, which re-activates their ``player@v1``; the push stream
-        takes them in as late joiners (it replays the PCM it still holds).
+        A broken stream moves all of the lane's members to PCM; a member that failed alone
+        moves by itself and the others carry on.
         """
-        members = [client.client_id for client in lane.clients]
-        self._logger.error(
-            "Coded %s lane failed for %s: %s. Switching them to PCM for the rest of the item.",
-            lane.variant.value,
-            members,
-            lane.error,
-        )
-        for client in lane.clients:
+        if lane.error is not None and not lane.handled:
+            lane.handled = True
+            members = list(lane.clients)
+            lane.clients = []
+            self._logger.error(
+                "Coded %s lane failed for %s: %s. Switching them to PCM for the rest of the item.",
+                lane.variant.value,
+                [c.client_id for c in members],
+                lane.error,
+            )
+            self._spawn(self._to_pcm(members))
+        while lane.bad_clients:
+            client, reason = lane.bad_clients.pop()
+            self._logger.error(
+                "Coded %s lane: %s dropped (%s). Switching it to PCM for the rest of the item.",
+                lane.variant.value,
+                client.client_id,
+                reason,
+            )
+            self._spawn(self._to_pcm([client]))
+
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
+        """Run a recovery in the background, kept so that close() can cancel it."""
+        task = asyncio.get_running_loop().create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _to_pcm(self, clients: list[SendspinClient]) -> None:
+        """
+        Give members the PCM channel for the rest of the item.
+
+        They leave coded mode, which re-activates their ``player@v1``; the push stream takes
+        them in as late joiners (it replays the PCM it still holds).
+        """
+        for client in clients:
             if (role := coded_role(client)) is not None:
                 with contextlib.suppress(Exception):
                     role.end_stream()
             try:
-                await iclforge_role.set_mode(client, "pcm")
+                await iclforge_role.set_mode(client, "pcm", STATE_TIMEOUT_S)
             except (iclforge_role.RoleError, TimeoutError) as err:
                 self._logger.error(
                     "%s could not be switched to PCM (%s), it recovers with the next item",
                     client.client_id,
                     err,
                 )
-        self.pcm_clients.extend(lane.clients)
-        lane.clients = []
+        self.pcm_clients.extend(clients)
 
     def _log_task_end(self, task: asyncio.Task[None]) -> None:
         if not task.cancelled() and (err := task.exception()):
@@ -527,7 +630,12 @@ async def build_coded_tap(
         )
         by_variant[variant].append(client)
         try:
+            was_coded = coded_role(client) is not None
             await iclforge_role.set_mode(client, "pcm" if variant == CodedVariant.PCM else "coded")
+            if variant == CodedVariant.PCM:
+                _ACTIVATED_AT.pop(client.client_id, None)
+            elif not was_coded:
+                _ACTIVATED_AT[client.client_id] = time.monotonic()
         except (iclforge_role.RoleError, TimeoutError) as err:
             logger.warning("Could not set the playback mode of %s: %s", client.client_id, err)
             if variant != CodedVariant.PCM:

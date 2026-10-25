@@ -14,7 +14,7 @@ from aiosendspin.models.types import AudioCodec as SendspinAudioCodec
 from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
 from aiosendspin.server.push_stream import MAIN_CHANNEL, PushStream, StreamStoppedError
 from aiosendspin.server.roles.player.v1 import PlayerV1Role
-from music_assistant_models.enums import ContentType, MediaType
+from music_assistant_models.enums import ContentType, MediaType, PlaybackState
 from music_assistant_models.media_items.audio_format import AudioFormat
 
 from music_assistant.constants import CONF_OUTPUT_CHANNELS
@@ -80,6 +80,8 @@ _PRODUCER_SLICE_US = 100_000
 _PRODUCER_BACKLOG_SIZE = 64
 # Backpressure threshold: push stream sleeps when buffered audio exceeds this.
 _PRODUCER_BUFFER_LIMIT_US = 30_000_000
+# tearing the coded tap down must never hold the player's playback lock longer than this
+_CODED_CLOSE_TIMEOUT_S = 2.0
 # Start join promotion once catchup processor lag is within this window of the history tail.
 _JOIN_PROMOTE_ARM_WINDOW_US = 2_000_000
 # Accept catchup output within this margin of the promotion target.
@@ -757,7 +759,17 @@ class SendspinPlaybackSession:
                 self._mapping_dirty = True
             if self._coded_tap is not None:
                 self.player.logger.info("Coded variants: %s", self._coded_tap.variants)
+                # a coded start takes a moment (clock convergence, priming): show it at once,
+                # or the user presses play again
+                self._show_starting()
                 await self._coded_tap.prepare()
+        except asyncio.CancelledError as err:
+            # stop or new media during the start: tear the tap down now, bounded, so that
+            # whoever cancelled this task (and holds the player's playback lock) never waits
+            await self._close_coded_tap()
+            if not str(err.args[0] if err.args else "").startswith("new media"):
+                self._show_idle()
+            raise
         except Exception:
             # A track change stops the previous stream without stream/end, so a failed
             # setup has to end this one. Cancellation propagates untouched, since there
@@ -1486,11 +1498,30 @@ class SendspinPlaybackSession:
         return self._coded_tap.first_play_start_us(push_stream.now_us(), floor_us)
 
     async def _close_coded_tap(self) -> None:
-        """End the coded streams of the session, if it had any."""
+        """End the coded streams of the session, if it had any (never waits long)."""
         tap, self._coded_tap = self._coded_tap, None
         if tap is not None:
-            with suppress(Exception):
-                await tap.close()
+            with suppress(Exception, TimeoutError):
+                async with asyncio.timeout(_CODED_CLOSE_TIMEOUT_S):
+                    await tap.close()
+
+    def _show_starting(self) -> None:
+        """Report the player as playing while a coded start is under way."""
+        self.player._attr_playback_state = PlaybackState.PLAYING
+        self.player.update_state()
+
+    def _show_idle(self) -> None:
+        """Undo :meth:`_show_starting` when the start was stopped before any audio."""
+        if (
+            self.player._attr_playback_state == PlaybackState.PLAYING
+            and not self._playback_running_audio()
+        ):
+            self.player._attr_playback_state = PlaybackState.IDLE
+            self.player.update_state()
+
+    def _playback_running_audio(self) -> bool:
+        """Return whether the session has committed audio."""
+        return self._timeline_start_us is not None
 
     def _get_audio_source(self, media: PlayerMedia) -> AsyncGenerator[bytes]:
         """

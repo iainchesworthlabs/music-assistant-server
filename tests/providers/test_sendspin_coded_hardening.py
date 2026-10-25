@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from music_assistant.providers.sendspin.coded import (
     first_play_start_us,
     fit_chunk_limit,
     pcm_message_bytes,
+    remaining_hold_s,
 )
 from music_assistant.providers.sendspin.ma_role import eac3
 from music_assistant.providers.sendspin.ma_role import role as iclforge_role
@@ -79,6 +81,9 @@ class _Support:
             )
         )
         self.client_id = "board"
+
+    def role(self, _role_id: str) -> None:
+        return None
 
 
 def _details(path: Path, codec: ContentType = ContentType.EAC3) -> StreamDetails:
@@ -152,6 +157,7 @@ async def test_failed_lane_moves_its_members_to_pcm_once(
     tap = CodedTap(logging.getLogger("t"), "x.ec3", 0, 6, 48000, [lane], [])
     await tap.on_commit(1_000_000, 100_000, 0)
     await tap.on_commit(1_100_000, 100_000, 0)
+    await asyncio.sleep(0.05)  # the switch runs in the background
     assert modes == [("board", "pcm")]
     assert role.ended
     assert role.sent == 0
@@ -174,6 +180,7 @@ async def test_failed_switch_is_logged_and_does_not_raise(
     tap = CodedTap(logging.getLogger("t"), "x.ec3", 0, 6, 48000, [lane], [])
     with caplog.at_level(logging.ERROR):
         await tap.on_commit(0, 100_000, 0)
+        await asyncio.sleep(0.05)
     text = caplog.text
     assert "c6" in text
     assert "sending to c6 failed: boom" in text
@@ -299,3 +306,102 @@ def test_chunk_limit_falls_back_to_flac_then_to_the_original() -> None:
     ]
     assert fit_chunk_limit(flac, (None, None), 4096)[1] == AudioCodec.FLAC
     assert fit_chunk_limit(pcm, (None, None), 4096) == (None, None)
+
+
+def test_hold_is_only_the_part_of_the_convergence_time_still_to_go() -> None:
+    """A role that has been active long enough needs no hold; a fresh one the whole of it."""
+    assert remaining_hold_s([0.0]) == 2.5
+    assert remaining_hold_s([1.0, 10.0]) == 1.5
+    assert remaining_hold_s([3.0, 60.0]) == 0.0
+    assert remaining_hold_s([]) == 0.0
+
+
+async def test_cancelling_a_full_demux_never_blocks_the_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The demux task of a full queue is cancelled by a stop; close() must come back at once."""
+
+    async def endless(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        data = EAC3.read_bytes()
+        while True:
+            for i in range(0, len(data), 4096):
+                await asyncio.sleep(0)
+                yield data[i : i + 4096]
+
+    role = _FakeRole()
+    monkeypatch.setattr(coded, "coded_role", lambda _client: role)
+    monkeypatch.setattr(coded, "get_eac3_demux_stream", endless)
+    lane = _Lane(variant=CodedVariant.FULL, clients=[SimpleNamespace(client_id="b")])  # type: ignore[list-item]
+    tap = CodedTap(logging.getLogger("t"), str(EAC3), 0, 6, 48000, [lane], [])
+    lane.task = asyncio.create_task(tap._demux(lane))
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if lane.queue.full():
+            break
+    assert lane.queue.full()
+    started = asyncio.get_running_loop().time()
+    async with asyncio.timeout(3):
+        await tap.close()
+    assert asyncio.get_running_loop().time() - started < 1.0
+    assert lane.demux_done
+
+
+async def test_prepare_cancelled_during_the_hold_stops_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop during the hold cancels prepare(); the demux tasks are then closed in no time."""
+
+    async def endless(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+        data = EAC3.read_bytes()
+        while True:
+            await asyncio.sleep(0)
+            yield data[:4096]
+
+    class _Role(_FakeRole):
+        async def wait_for_state(self, timeout: float = 0) -> None:
+            return None
+
+    role = _Role()
+    monkeypatch.setattr(coded, "coded_role", lambda _client: role)
+    monkeypatch.setattr(coded, "get_eac3_demux_stream", endless)
+    lane = _Lane(variant=CodedVariant.FULL, clients=[SimpleNamespace(client_id="b")])  # type: ignore[list-item]
+    tap = CodedTap(logging.getLogger("t"), str(EAC3), 0, 6, 48000, [lane], [])
+    coded._ACTIVATED_AT["b"] = time.monotonic()
+    task = asyncio.create_task(tap.prepare())
+    await asyncio.sleep(0.2)  # inside the 2.5 s hold, the demux is running
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    async with asyncio.timeout(2):
+        await tap.close()
+    assert lane.demux_done
+    assert lane.task is not None
+    assert lane.task.done()
+    coded._ACTIVATED_AT.pop("b", None)
+
+
+async def test_one_member_failing_does_not_take_the_others_off_the_coded_stream(
+    modes: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A killed member (send error, or its role gone) alone moves to PCM; the rest carry on."""
+    good, bad = _FakeRole(), _FakeRole()
+
+    def failing(*_args: Any) -> None:
+        raise iclforge_role.RoleError("socket closed")
+
+    bad.send_burst = failing  # type: ignore[method-assign,assignment]
+    roles = {"good": good, "bad": bad}
+    monkeypatch.setattr(coded, "coded_role", lambda client: roles.get(client.client_id))
+    clients = [SimpleNamespace(client_id=n) for n in ("good", "bad", "gone")]
+    lane = _Lane(variant=CodedVariant.FULL, clients=clients)  # type: ignore[arg-type]
+    for _ in range(5):
+        lane.queue.put_nowait(eac3.Burst(payload=b"\0" * 4))
+    tap = CodedTap(logging.getLogger("t"), "x.ec3", 0, 6, 48000, [lane], [])
+    await tap.on_commit(1_000_000, 60_000_000, 0)
+    await asyncio.sleep(0.05)
+    assert good.sent == 5
+    assert [c.client_id for c in lane.clients] == ["good"]
+    assert sorted(m for m, _ in modes) == ["bad", "gone"]
+    assert all(mode == "pcm" for _, mode in modes)
+    assert lane.error is None
