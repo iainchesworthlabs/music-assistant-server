@@ -57,6 +57,8 @@ PRIME_BURSTS = 24
 PRIME_TIMEOUT_S = 3.0
 # nothing in the teardown of a tap may wait longer than this
 CLOSE_TIMEOUT_S = 1.5
+# a coded item resumed this close to its end starts over from the beginning
+RESTART_THRESHOLD_S = 2.0
 STATE_TIMEOUT_S = 3.0
 # a board that decodes 15-object material at 192 kb/s stereo at its limit (the C6) gets less to chew
 STEREO_BIT_RATE = 128_000
@@ -129,6 +131,21 @@ def fit_chunk_limit(
                 wanted,
             )
     return preferred
+
+
+def resume_position_s(seek_s: float, duration_s: float | None) -> float:
+    """
+    Return where a coded item should start: over from 0 when it is asked to start at its end.
+
+    A queue that stopped or ended on this item can hand over its end as the resume position;
+    started there the item has nothing left to send and the play button seems to do nothing.
+
+    :param seek_s: The position the queue asks to start at, in seconds.
+    :param duration_s: The duration of the item, if known.
+    """
+    if duration_s and seek_s >= duration_s - RESTART_THRESHOLD_S:
+        return 0.0
+    return seek_s
 
 
 # monotonic time at which each client's coded role was activated by this module
@@ -274,6 +291,12 @@ class CodedTap:
         self._clock_anchor: tuple[int, float] | None = None
         self._sender: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[None]] = set()
+        self._expected_members = any(lane.clients for lane in lanes)
+
+    @property
+    def sent_nothing(self) -> bool:
+        """Return True if members were expected to get bursts and not one was sent."""
+        return self._expected_members and all(lane.sent == 0 for lane in self._lanes)
 
     @property
     def variants(self) -> dict[str, str]:

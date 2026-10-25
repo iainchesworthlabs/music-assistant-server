@@ -21,6 +21,7 @@ from music_assistant.constants import CONF_OUTPUT_CHANNELS
 from music_assistant.controllers.streams.audio_processing import get_media_session_id
 from music_assistant.helpers.audio import iter_pcm_slices
 from music_assistant.helpers.ffmpeg import FFMpeg
+from music_assistant.helpers.passthrough import is_coded_passthrough_candidate
 from music_assistant.helpers.util import import_module_in_thread
 from music_assistant.models.player import PlayerMedia
 from music_assistant.providers.sendspin.bridge_role import (
@@ -29,7 +30,11 @@ from music_assistant.providers.sendspin.bridge_role import (
     BRIDGE_SAMPLE_RATE,
     BridgePlayerRole,
 )
-from music_assistant.providers.sendspin.coded import CodedTap, build_coded_tap
+from music_assistant.providers.sendspin.coded import (
+    CodedTap,
+    build_coded_tap,
+    resume_position_s,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterable
@@ -738,6 +743,7 @@ class SendspinPlaybackSession:
                 "Sendspin session PCM format: %d Hz / F32",
                 self._pcm_format.sample_rate,
             )
+            self._restart_if_at_end(media)
             # coded members change role before the group's first commit; the tap is None for
             # an item (or group) that has no coded member
             self._coded_tap = await build_coded_tap(
@@ -1504,6 +1510,32 @@ class SendspinPlaybackSession:
             with suppress(Exception, TimeoutError):
                 async with asyncio.timeout(_CODED_CLOSE_TIMEOUT_S):
                     await tap.close()
+            if tap.sent_nothing:
+                self.player.logger.error(
+                    "No coded burst was sent for %s (the item started at its end, or the demux "
+                    "produced nothing): the members played nothing",
+                    self.player.display_name,
+                )
+                self.player._attr_playback_state = PlaybackState.IDLE
+                self.player.update_state()
+
+    def _restart_if_at_end(self, media: PlayerMedia) -> None:
+        """Start a coded item over from 0 when the queue hands over its end as the position."""
+        details = self._start_streamdetails
+        if details is None or not is_coded_passthrough_candidate(details):
+            return
+        seek = float(details.seek_position or 0)
+        start = resume_position_s(seek, float(details.duration or 0))
+        if start == seek:
+            return
+        self.player.logger.info(
+            "Coded item resumed at %.1f s of %s s: starting it over from 0", seek, details.duration
+        )
+        details.seek_position = int(start)
+        queue = self.player.mass.player_queues.get(media.source_id) if media.source_id else None
+        if queue is not None:
+            queue.elapsed_time = start
+            queue.elapsed_time_last_updated = time.time()
 
     def _show_starting(self) -> None:
         """Report the player as playing while a coded start is under way."""

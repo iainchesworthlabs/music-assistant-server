@@ -34,6 +34,7 @@ from music_assistant.providers.sendspin.coded import (
     fit_chunk_limit,
     pcm_message_bytes,
     remaining_hold_s,
+    resume_position_s,
 )
 from music_assistant.providers.sendspin.ma_role import eac3
 from music_assistant.providers.sendspin.ma_role import role as iclforge_role
@@ -405,3 +406,27 @@ async def test_one_member_failing_does_not_take_the_others_off_the_coded_stream(
     assert sorted(m for m, _ in modes) == ["bad", "gone"]
     assert all(mode == "pcm" for _, mode in modes)
     assert lane.error is None
+
+
+def test_a_coded_item_asked_to_start_at_its_end_starts_over() -> None:
+    """A queue that parked at the end of an item must not start it there (nothing would play)."""
+    assert resume_position_s(72.0, 72.0) == 0.0
+    assert resume_position_s(71.0, 72.0) == 0.0
+    assert resume_position_s(69.0, 72.0) == 69.0
+    assert resume_position_s(5.0, 72.0) == 5.0
+    assert resume_position_s(12.0, None) == 12.0
+
+
+def _nothing_sent(tap: CodedTap) -> bool:
+    return tap.sent_nothing
+
+
+async def test_a_tap_that_sent_no_burst_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Members expected, nothing sent: reported so the session can log it and not stay 'playing'."""
+    monkeypatch.setattr(coded, "coded_role", lambda _client: _FakeRole())
+    lane = _Lane(variant=CodedVariant.FULL, clients=[SimpleNamespace(client_id="b")])  # type: ignore[list-item]
+    tap = CodedTap(logging.getLogger("t"), "x.ec3", 0, 6, 48000, [lane], [])
+    assert tap.sent_nothing
+    lane.queue.put_nowait(eac3.Burst(payload=b"\0" * 4))
+    await tap.on_commit(1_000_000, 60_000_000, 0)
+    assert not tap.sent_nothing
