@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from music_assistant.helpers import custom_ca
+from music_assistant.helpers import ssl as mass_ssl
 
 _ENV_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", custom_ca.ENV_EXTRA_CA_FILE)
 
@@ -188,3 +189,50 @@ def test_garbage_file_ignored(tmp_path: Path) -> None:
     ca_dir.mkdir()
     (ca_dir / "bad.pem").write_text("not a certificate")
     assert custom_ca.setup_custom_ca_trust(tmp_path / "data", (ca_dir,)) is None
+
+
+async def _ws_ok(port: int) -> bool:
+    """Open a websocket the way the HA client does: on a session with Music Assistant's context."""
+    connector = aiohttp.TCPConnector(ssl=mass_ssl.client_context())
+    try:
+        async with (
+            aiohttp.ClientSession(connector=connector) as session,
+            session.ws_connect(f"wss://localhost:{port}/ws") as ws,
+        ):
+            await ws.send_str("ping")
+            return (await ws.receive_str()) == "ping"
+    except aiohttp.ClientConnectorCertificateError:
+        return False
+
+
+async def _run_ws(leaf: Path, key: Path, ca_dir: Path, data_dir: Path) -> tuple[bool, bool]:
+    async def ws_handler(request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_str(await ws.receive_str())
+        await ws.close()
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/ws", ws_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(str(leaf), str(key))
+    await web.TCPSite(runner, "127.0.0.1", 0, ssl_context=server_ctx).start()
+    port = runner.addresses[0][1]
+    try:
+        before = await _ws_ok(port)
+        custom_ca.setup_custom_ca_trust(data_dir, (ca_dir,))
+        return before, await _ws_ok(port)
+    finally:
+        await runner.cleanup()
+
+
+def test_websocket_on_mass_ssl_context(tmp_path: Path) -> None:
+    """The import-time contexts of music_assistant.helpers.ssl also trust the extra CA."""
+    ca, leaf, key = _make_ca_and_leaf(tmp_path)
+    ca_dir = tmp_path / "cas"
+    ca_dir.mkdir()
+    (ca_dir / "private.crt").write_bytes(ca.read_bytes())
+    assert asyncio.run(_run_ws(leaf, key, ca_dir, tmp_path / "data")) == (False, True)
