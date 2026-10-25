@@ -120,6 +120,11 @@ def _patch_default_ssl_context(extra_path: Path) -> None:
     # aiohttp builds its verified context once, at import time: add the CAs to that one too
     if (connector := sys.modules.get("aiohttp.connector")) is not None:
         connector._SSL_CONTEXT_VERIFIED.load_verify_locations(cafile=str(extra_path))
+    # so does Music Assistant's own ssl helper (used by the shared http_session and so by the
+    # Home Assistant websocket client)
+    if (mass_ssl := sys.modules.get("music_assistant.helpers.ssl")) is not None:
+        for context in (mass_ssl._DEFAULT_SSL_CONTEXT, *mass_ssl._SSL_CONTEXTS.values()):
+            context.load_verify_locations(cafile=str(extra_path))
 
 
 def setup_custom_ca_trust(
