@@ -309,6 +309,7 @@ class SendspinPlaybackSession:
         self._member_pipelines: dict[str, _MemberPipeline] = {}
         self._push_stream: PushStream | None = None
         self._coded_tap: CodedTap | None = None
+        self._session_token: object | None = None
         self._playback_running = False
         self._producer_eof_sent = False
         self._timeline_start_us: int | None = None
@@ -726,6 +727,11 @@ class SendspinPlaybackSession:
         # push the timeline into a forward rebase.
         await import_module_in_thread("av")
         push_stream: PushStream | None = None
+        # a cancelled session's commit loop may outlive its task for a moment: everything it
+        # touches on the shared session is guarded by this token, and it keeps to its own tap
+        session_token = object()
+        self._session_token = session_token
+        tap: CodedTap | None = None
         try:
             # let automatic Sendspin formats follow the first item's sample rate, then
             # refresh the session PCM format from the leader's preferred output before
@@ -746,7 +752,7 @@ class SendspinPlaybackSession:
             self._restart_if_at_end(media)
             # coded members change role before the group's first commit; the tap is None for
             # an item (or group) that has no coded member
-            self._coded_tap = await build_coded_tap(
+            tap = self._coded_tap = await build_coded_tap(
                 self.player.logger,
                 self.player.api.group.clients,
                 self._start_streamdetails,
@@ -763,16 +769,16 @@ class SendspinPlaybackSession:
                 self._timeline_start_us = None
                 self._first_commit_monotonic_us = None
                 self._mapping_dirty = True
-            if self._coded_tap is not None:
-                self.player.logger.info("Coded variants: %s", self._coded_tap.variants)
+            if tap is not None:
+                self.player.logger.info("Coded variants: %s", tap.variants)
                 # a coded start takes a moment (clock convergence, priming): show it at once,
                 # or the user presses play again
                 self._show_starting()
-                await self._coded_tap.prepare()
+                await tap.prepare()
         except asyncio.CancelledError as err:
             # stop or new media during the start: tear the tap down now, bounded, so that
             # whoever cancelled this task (and holds the player's playback lock) never waits
-            await self._close_coded_tap()
+            await self._close_coded_tap(tap)
             if not str(err.args[0] if err.args else "").startswith("new media"):
                 self._show_idle()
             raise
@@ -783,7 +789,7 @@ class SendspinPlaybackSession:
             if push_stream is not None:
                 with suppress(Exception):
                     push_stream.stop()
-            await self._close_coded_tap()
+            await self._close_coded_tap(tap)
             await self._reset_session_state()
             raise
         # Bounded queue between producer (stream reader) and consumer (committer).
@@ -848,11 +854,11 @@ class SendspinPlaybackSession:
                         await close_task
                         raise
 
-        async def _commit_pending_chunks() -> None:
+        async def _commit_pending_chunks() -> None:  # noqa: PLR0915
             nonlocal pending_duration_us, last_elapsed_update_s
             while True:
                 pending = await pending_chunks.get()
-                if pending is None:
+                if pending is None or self._session_token is not session_token:
                     break
                 pending_backlog.popleft()
                 pending_duration_us = max(0, pending_duration_us - pending.duration_us)
@@ -894,24 +900,28 @@ class SendspinPlaybackSession:
                     )
                 try:
                     commit_start_us = await push_stream.commit_audio(
-                        play_start_us=self._first_commit_play_start_us(push_stream)
+                        play_start_us=self._first_commit_play_start_us(push_stream, tap)
                     )
                 except StreamStoppedError:
                     # Stream stopped since it was replaced by another stream
                     self.player.logger.debug("Stopping commit loop due to stopped push stream")
                     break
+                if self._session_token is not session_token:
+                    break  # superseded while committing: the new session owns the shared state
                 await push_stream.sleep_to_limit_buffer(_PRODUCER_BUFFER_LIMIT_US)
                 commit_now_us = push_stream.now_us()
-                if self._coded_tap is not None:
-                    await self._coded_tap.on_commit(
-                        int(commit_start_us), pending.duration_us, commit_now_us
-                    )
+                if self._session_token is not session_token:
+                    break  # superseded while waiting: do not touch the new session's state
+                if tap is not None:
+                    await tap.on_commit(int(commit_start_us), pending.duration_us, commit_now_us)
                 committed_history_chunk = _HistoryChunk(
                     start_time_us=int(commit_start_us),
                     duration_us=pending.duration_us,
                     pcm=pending.pcm,
                 )
                 async with self._state_lock:
+                    if self._session_token is not session_token:
+                        break
                     if self._timeline_start_us is None:
                         self._timeline_start_us = int(commit_start_us)
                     if self._first_commit_monotonic_us is None:
@@ -982,24 +992,27 @@ class SendspinPlaybackSession:
                     # and let the new playback handle the transition.
                     producer_stopped_cleanly = False
             await self._close_coded_tap(
-                natural=producer_stopped_cleanly and not self._cancel_requested
+                tap, natural=producer_stopped_cleanly and not self._cancel_requested
             )
-            with suppress(Exception):
-                # Same condition as the group.stop() below, so we snapshot on exactly the
-                # paths where a group STOP is already emitted. That stop resets the reported
-                # position to 0 (spec: stop rewinds), so the snapshot only carries the
-                # position if the stop below raises.
-                self._stop_push_stream(
-                    snapshot_progress=producer_stopped_cleanly and not self._cancel_requested,
-                )
-            await self._clear_join_catchup()
-            await self._clear_member_pipelines()
-            await self._reset_session_state()
-            # Only emit a group STOP when MA stream playback reached natural EOF.
-            # Skip this on cancellation/error paths to avoid stop-event races with transitions.
-            if producer_stopped_cleanly and not self._cancel_requested:
+            if self._session_token is session_token:
+                # (a new session that took over while this one was still ending owns the push
+                # stream, the pipelines and the timeline: none of it is ours to clean up)
                 with suppress(Exception):
-                    await self.player.api.group.stop()
+                    # Same condition as the group.stop() below, so we snapshot on exactly the
+                    # paths where a group STOP is already emitted. That stop resets the reported
+                    # position to 0 (spec: stop rewinds), so the snapshot only carries the
+                    # position if the stop below raises.
+                    self._stop_push_stream(
+                        snapshot_progress=producer_stopped_cleanly and not self._cancel_requested,
+                    )
+                await self._clear_join_catchup()
+                await self._clear_member_pipelines()
+                await self._reset_session_state()
+                # Only emit a group STOP when MA stream playback reached natural EOF.
+                # Skip this on cancellation/error paths to avoid stop-event races with transitions.
+                if producer_stopped_cleanly and not self._cancel_requested:
+                    with suppress(Exception):
+                        await self.player.api.group.stop()
 
     # -- Join injection --------------------------------------------------------
 
@@ -1493,26 +1506,36 @@ class SendspinPlaybackSession:
             ps.clear()
         ps.stop(keep_stream=keep_stream)
 
-    def _first_commit_play_start_us(self, push_stream: PushStream) -> int | None:
+    def _first_commit_play_start_us(
+        self, push_stream: PushStream, tap: CodedTap | None
+    ) -> int | None:
         """
         Return the explicit play start of the first commit of a session with coded members.
 
         The coded members' lead (their required lead time plus a margin) decides when it is larger
         than the one the push stream would use; later commits continue that timeline.
         """
-        if self._coded_tap is None or self._timeline_start_us is not None:
+        if tap is None or self._timeline_start_us is not None:
             return None
         floor_us = getattr(push_stream, "_min_send_ahead_us", lambda: 0)()
-        return self._coded_tap.first_play_start_us(push_stream.now_us(), floor_us)
+        now_us = push_stream.now_us()
+        start_us = tap.first_play_start_us(now_us, floor_us)
+        self.player.logger.info(
+            "Coded first commit: push stream floor %d ms, play start %d ms from now",
+            floor_us // 1000,
+            (start_us - now_us) // 1000,
+        )
+        return start_us
 
-    async def _close_coded_tap(self, *, natural: bool = False) -> None:
+    async def _close_coded_tap(self, tap: CodedTap | None, *, natural: bool = False) -> None:
         """
         End the coded streams of the session, if it had any (never waits long).
 
         :param natural: The item played to its end: the sinks play out what they hold. Any
             other end (stop, pause, new media, seek) has them flush at once.
         """
-        tap, self._coded_tap = self._coded_tap, None
+        if self._coded_tap is tap:
+            self._coded_tap = None
         if tap is not None:
             with suppress(Exception, TimeoutError):
                 async with asyncio.timeout(_CODED_CLOSE_TIMEOUT_S):

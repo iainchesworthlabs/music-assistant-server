@@ -39,6 +39,7 @@ from music_assistant.providers.sendspin.coded import (
 )
 from music_assistant.providers.sendspin.ma_role import eac3
 from music_assistant.providers.sendspin.ma_role import role as iclforge_role
+from music_assistant.providers.sendspin.playback import SendspinPlaybackSession
 
 AUDIO = Path(__file__).parent.parent / "fixtures" / "audio"
 EAC3 = AUDIO / "atmos-51-1s.ec3"
@@ -522,3 +523,39 @@ async def _empty_demux(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
     empty: list[bytes] = []
     for chunk in empty:
         yield chunk
+
+
+def _bare_session() -> SendspinPlaybackSession:
+    session = SendspinPlaybackSession.__new__(SendspinPlaybackSession)
+    session._timeline_start_us = None
+    session._coded_tap = None
+    session.player = SimpleNamespace(  # type: ignore[assignment]
+        logger=logging.getLogger("t"), display_name="p", update_state=lambda: None
+    )
+    return session
+
+
+def test_the_first_commit_start_comes_from_the_sessions_own_tap() -> None:
+    """A session passes its own tap: whatever is on the shared attribute does not matter."""
+    session = _bare_session()
+    push_stream = SimpleNamespace(now_us=lambda: 1_000_000, _min_send_ahead_us=lambda: 250_000)
+    mine = SimpleNamespace(first_play_start_us=lambda now, _floor: now + 800_000)
+    session._coded_tap = SimpleNamespace(  # type: ignore[assignment]
+        first_play_start_us=lambda *_a: 99
+    )
+    assert session._first_commit_play_start_us(push_stream, mine) == 1_800_000  # type: ignore[arg-type]
+    assert session._first_commit_play_start_us(push_stream, None) is None  # type: ignore[arg-type]
+    session._timeline_start_us = 5
+    assert session._first_commit_play_start_us(push_stream, mine) is None  # type: ignore[arg-type]
+
+
+async def test_a_finished_session_does_not_drop_the_tap_of_the_next_one() -> None:
+    """A late-ending old session closes its own tap and leaves the new session's tap alone."""
+    session = _bare_session()
+    old = CodedTap(logging.getLogger("t"), "x.ec3", 0, 6, 48000, [], [])
+    new = CodedTap(logging.getLogger("t"), "x.ec3", 0, 6, 48000, [], [])
+    session._coded_tap = new
+    await session._close_coded_tap(old)
+    assert session._coded_tap is new
+    await session._close_coded_tap(new)
+    assert session._coded_tap is None
