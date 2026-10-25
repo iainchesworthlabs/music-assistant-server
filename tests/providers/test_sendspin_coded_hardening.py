@@ -32,6 +32,7 @@ from music_assistant.providers.sendspin.coded import (
     coded_start_lead_us,
     first_play_start_us,
     fit_chunk_limit,
+    flush_previous_stream,
     pcm_message_bytes,
     remaining_hold_s,
     resume_position_s,
@@ -460,3 +461,64 @@ async def test_stop_flushes_the_sinks_before_ending_and_a_natural_end_does_not(
     tap = CodedTap(logging.getLogger("t"), "x.ec3", 0, 6, 48000, [lane], [])
     await tap.close(flush=flush)
     assert [e for e in events if e != "drop"] == expected
+
+
+def test_a_big_buffer_member_is_flushed_before_its_roles_switch() -> None:
+    """The old player@v1 stream is cleared (priority message) before the coded role activates."""
+    events: list[str] = []
+    connection = SimpleNamespace(
+        send_priority_message=lambda message: events.append(type(message).__name__)
+    )
+    playing = SimpleNamespace(
+        client_id="pc",
+        connection=connection,
+        role=lambda role_id: object() if role_id == "player@v1" else None,
+        drop_pending_binary=lambda roles: events.append(f"drop {roles}"),
+    )
+    flush_previous_stream(playing)  # type: ignore[arg-type]
+    assert events == ["drop ['player']", "StreamClearMessage"]
+    events.clear()
+    idle = SimpleNamespace(
+        client_id="pc",
+        connection=connection,
+        role=lambda _role_id: None,
+        drop_pending_binary=lambda _roles: events.append("drop"),
+    )
+    flush_previous_stream(idle)  # type: ignore[arg-type]
+    assert events == []  # a member without an active player@v1 is left alone
+
+
+async def test_a_connected_member_ending_its_old_stream_is_waited_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A role state that comes late from a connected member does not drop it to PCM."""
+    monkeypatch.setattr(coded, "STATE_TIMEOUT_S", 0.05)
+    calls: list[float] = []
+
+    class _Slow(_FakeRole):
+        def start_stream(self, *_args: Any) -> None:
+            return None
+
+        async def wait_for_state(self, timeout: float = 0) -> None:
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise TimeoutError
+
+    role = _Slow()
+    monkeypatch.setattr(coded, "coded_role", lambda _client: role)
+    monkeypatch.setattr(coded, "get_eac3_demux_stream", _empty_demux)
+    client = SimpleNamespace(client_id="pc", is_connected=True)
+    lane = _Lane(variant=CodedVariant.FULL, clients=[client])  # type: ignore[list-item]
+    tap = CodedTap(logging.getLogger("t"), "x.ec3", 0, 6, 48000, [lane], [])
+    coded._ACTIVATED_AT["pc"] = time.monotonic() - 10
+    await tap.prepare()
+    coded._ACTIVATED_AT.pop("pc", None)
+    assert len(calls) == 2
+    assert lane.clients == [client]
+    await tap.close()
+
+
+async def _empty_demux(*_args: Any, **_kwargs: Any) -> AsyncGenerator[bytes]:
+    empty: list[bytes] = []
+    for chunk in empty:
+        yield chunk

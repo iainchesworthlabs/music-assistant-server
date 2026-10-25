@@ -51,6 +51,8 @@ if TYPE_CHECKING:
     from music_assistant_models.streamdetails import StreamDetails
 
 DATA_TYPE = "eac3"
+PLAYER_ROLE_ID = iclforge_role.PLAYER_ROLE_ID
+PLAYER_FAMILY = "player"
 # the sink holds a coded start until its clock converged (about 2 s after activation)
 CODED_START_HOLD_S = 2.5
 # bursts every lane must have ready before the first commit, and how long to wait for them
@@ -61,6 +63,9 @@ CLOSE_TIMEOUT_S = 1.5
 # a coded item resumed this close to its end starts over from the beginning
 RESTART_THRESHOLD_S = 2.0
 STATE_TIMEOUT_S = 3.0
+# a member that is still connected may be busy ending its previous stream: it gets this much
+# longer for its role state before it is given up on
+STATE_PATIENCE_S = 12.0
 # a board that decodes 15-object material at 192 kb/s stereo at its limit (the C6) gets less to chew
 STEREO_BIT_RATE = 128_000
 # the push stream cuts PCM into 25 ms chunks; a board states the largest message it takes
@@ -237,6 +242,25 @@ def coded_role(client: SendspinClient) -> iclforge_role.IclforgePlayerRole | Non
     return role if isinstance(role, iclforge_role.IclforgePlayerRole) else None
 
 
+def flush_previous_stream(client: SendspinClient) -> None:
+    """
+    Have a member drop what its ``player@v1`` stream still holds, before its roles are switched.
+
+    A member with a big buffer (the PC states 33.5 MB, 30 s or more of PCM queued in it) must
+    not play on, or sit on the old stream, while the new roles activate. stream/clear goes as a
+    priority message: the role queue is discarded when the role is deactivated.
+
+    :param client: The member about to change role.
+    """
+    if client.role(PLAYER_ROLE_ID) is None:
+        return
+    client.drop_pending_binary([PLAYER_FAMILY])
+    if (connection := getattr(client, "connection", None)) is not None:
+        connection.send_priority_message(
+            StreamClearMessage(payload=StreamClearPayload(roles=[PLAYER_FAMILY]))
+        )
+
+
 def client_support(client: SendspinClient) -> iclforge_role.IclforgePlayerSupport | None:
     """Return the role support a client stated in its hello, if any."""
     return getattr(client.info, f"{iclforge_role.FAMILY}_support", None)
@@ -326,7 +350,18 @@ class CodedTap:
                 try:
                     if role is None:
                         raise iclforge_role.RoleError("coded role not active")
-                    await role.wait_for_state(STATE_TIMEOUT_S)
+                    try:
+                        await role.wait_for_state(STATE_TIMEOUT_S)
+                    except TimeoutError:
+                        if not getattr(client, "is_connected", False):
+                            raise
+                        self._logger.warning(
+                            "%s has not reported its coded role yet (still ending its previous "
+                            "stream?), waiting up to %.0f s more",
+                            client.client_id,
+                            STATE_PATIENCE_S,
+                        )
+                        await role.wait_for_state(STATE_PATIENCE_S)
                 except (iclforge_role.RoleError, TimeoutError) as err:
                     self._drop_client(lane, client, f"its coded role is not ready: {err!r}")
         if not any(lane.clients for lane in self._lanes):
@@ -678,6 +713,8 @@ async def build_coded_tap(
         by_variant[variant].append(client)
         try:
             was_coded = coded_role(client) is not None
+            if variant != CodedVariant.PCM:
+                flush_previous_stream(client)
             await iclforge_role.set_mode(client, "pcm" if variant == CodedVariant.PCM else "coded")
             if variant == CodedVariant.PCM:
                 _ACTIVATED_AT.pop(client.client_id, None)
