@@ -438,7 +438,7 @@ class CodedTap:
         if self._timeline_start_us is None:
             self._timeline_start_us = commit_start_us
             self.first_lead_us = commit_start_us - now_us
-            self._logger.debug(
+            self._logger.info(
                 "Coded tap starts at %d us, %.0f ms from now",
                 commit_start_us,
                 self.first_lead_us / 1000,
