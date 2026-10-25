@@ -28,6 +28,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from aiosendspin.models import AudioCodec
+from aiosendspin.models.core import StreamClearMessage, StreamClearPayload
 from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
 from music_assistant_models.enums import ContentType
 
@@ -412,23 +413,18 @@ class CodedTap:
             self._send_due(lane)
             self._handle_failures(lane)
 
-    async def close(self, *, drain: bool = False) -> None:
+    async def close(self, *, drain: bool = False, flush: bool = True) -> None:
         """
         End the coded streams and stop the demux tasks.
 
         :param drain: Send what is still queued first (end of the item), else drop it.
+        :param flush: Have the sinks drop what they hold at once (stop, pause, new media, seek)
+            before the stream ends; False at the natural end of the item, which they play out.
         """
         tasks = [t for t in (self._sender, *(lane.task for lane in self._lanes)) if t is not None]
         tasks.extend(self._background)
         for task in tasks:
             task.cancel()
-        if tasks:
-            # never wait unbounded: a stuck ffmpeg or send must not hold the session's lock
-            _, pending = await asyncio.wait(tasks, timeout=CLOSE_TIMEOUT_S)
-            if pending:
-                self._logger.warning(
-                    "%d coded task(s) did not stop within %.1f s", len(pending), CLOSE_TIMEOUT_S
-                )
         for lane in self._lanes:
             if drain:
                 self._produced_us = 1 << 62
@@ -444,8 +440,36 @@ class CodedTap:
             )
             for client in lane.clients:
                 if (role := coded_role(client)) is not None:
-                    with contextlib.suppress(Exception):
+                    try:
+                        if flush:
+                            self._flush_sink(client)
                         role.end_stream()
+                    except Exception as err:
+                        self._logger.warning(
+                            "Ending the coded stream of %s failed: %r", client.client_id, err
+                        )
+        # the sinks hear the end first, and only then is the (possibly slow) ffmpeg teardown awaited
+        if tasks:
+            # never wait unbounded: a stuck ffmpeg or send must not hold the session's lock
+            _, pending = await asyncio.wait(tasks, timeout=CLOSE_TIMEOUT_S)
+            if pending:
+                self._logger.warning(
+                    "%d coded task(s) did not stop within %.1f s", len(pending), CLOSE_TIMEOUT_S
+                )
+
+    @staticmethod
+    def _flush_sink(client: SendspinClient) -> None:
+        """
+        Have the sink drop what it holds, now.
+
+        stream/clear goes as a priority message: the role queue it would otherwise wait in is
+        discarded when the group's stop deactivates the role, and the clear would never be sent.
+        """
+        client.drop_pending_binary([iclforge_role.FAMILY])
+        if (connection := getattr(client, "connection", None)) is not None:
+            connection.send_priority_message(
+                StreamClearMessage(payload=StreamClearPayload(roles=[iclforge_role.FAMILY]))
+            )
 
     def _send_due(self, lane: _Lane) -> None:
         """Send queued bursts of a lane whose start lies inside the committed timeline."""

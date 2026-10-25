@@ -136,12 +136,17 @@ class _FakeRole:
     def __init__(self) -> None:
         self.sent = 0
         self.ended = False
+        self.calls: list[str] = []
 
     def send_burst(self, burst: eac3.Burst, timestamp_us: int) -> None:
         self.sent += 1
 
     def end_stream(self) -> None:
         self.ended = True
+        self.calls.append("end")
+
+    def clear_stream(self) -> None:
+        self.calls.append("clear")
 
 
 async def test_failed_lane_moves_its_members_to_pcm_once(
@@ -430,3 +435,28 @@ async def test_a_tap_that_sent_no_burst_says_so(monkeypatch: pytest.MonkeyPatch)
     lane.queue.put_nowait(eac3.Burst(payload=b"\0" * 4))
     await tap.on_commit(1_000_000, 60_000_000, 0)
     assert not tap.sent_nothing
+
+
+@pytest.mark.parametrize(("flush", "expected"), [(True, ["clear", "end"]), (False, ["end"])])
+async def test_stop_flushes_the_sinks_before_ending_and_a_natural_end_does_not(
+    monkeypatch: pytest.MonkeyPatch, flush: bool, expected: list[str]
+) -> None:
+    """Stop, pause, new media and seek flush the sink (stream/clear, as a priority message)."""
+    events: list[str] = []
+    role = _FakeRole()
+    role.end_stream = lambda: events.append("end")  # type: ignore[method-assign]
+    monkeypatch.setattr(coded, "coded_role", lambda _client: role)
+    connection = SimpleNamespace(
+        send_priority_message=lambda message: events.append(
+            "clear" if type(message).__name__ == "StreamClearMessage" else "other"
+        )
+    )
+    client = SimpleNamespace(
+        client_id="b",
+        connection=connection,
+        drop_pending_binary=lambda _roles: events.append("drop"),
+    )
+    lane = _Lane(variant=CodedVariant.FULL, clients=[client])  # type: ignore[list-item]
+    tap = CodedTap(logging.getLogger("t"), "x.ec3", 0, 6, 48000, [lane], [])
+    await tap.close(flush=flush)
+    assert [e for e in events if e != "drop"] == expected
