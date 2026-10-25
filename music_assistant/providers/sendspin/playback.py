@@ -981,7 +981,9 @@ class SendspinPlaybackSession:
                     # non-clean stop so we skip group.stop() below
                     # and let the new playback handle the transition.
                     producer_stopped_cleanly = False
-            await self._close_coded_tap()
+            await self._close_coded_tap(
+                natural=producer_stopped_cleanly and not self._cancel_requested
+            )
             with suppress(Exception):
                 # Same condition as the group.stop() below, so we snapshot on exactly the
                 # paths where a group STOP is already emitted. That stop resets the reported
@@ -1503,13 +1505,18 @@ class SendspinPlaybackSession:
         floor_us = getattr(push_stream, "_min_send_ahead_us", lambda: 0)()
         return self._coded_tap.first_play_start_us(push_stream.now_us(), floor_us)
 
-    async def _close_coded_tap(self) -> None:
-        """End the coded streams of the session, if it had any (never waits long)."""
+    async def _close_coded_tap(self, *, natural: bool = False) -> None:
+        """
+        End the coded streams of the session, if it had any (never waits long).
+
+        :param natural: The item played to its end: the sinks play out what they hold. Any
+            other end (stop, pause, new media, seek) has them flush at once.
+        """
         tap, self._coded_tap = self._coded_tap, None
         if tap is not None:
             with suppress(Exception, TimeoutError):
                 async with asyncio.timeout(_CODED_CLOSE_TIMEOUT_S):
-                    await tap.close()
+                    await tap.close(flush=not natural)
             if tap.sent_nothing:
                 self.player.logger.error(
                     "No coded burst was sent for %s (the item started at its end, or the demux "
